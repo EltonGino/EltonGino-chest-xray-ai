@@ -1,0 +1,21 @@
+# Dataset
+data/
+
+# Model weights
+checkpoints/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+
+# Node
+frontend/node_modules/
+
+# Mac
+.DS_Store
+
+# Outputs (optional — keep figures, ignore large eval files)
+outputs/eval_*/
