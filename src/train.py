@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Training Pipeline for NIH Chest X-ray14
 =========================================
@@ -14,6 +15,11 @@ Usage:
 import os
 import sys
 import time
+
+# Force UTF-8 output on Windows (avoids cp1252 UnicodeEncodeError)
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1)
+    sys.stderr = open(sys.stderr.fileno(), mode="w", encoding="utf-8", buffering=1)
 import argparse
 import platform
 from pathlib import Path
@@ -43,7 +49,7 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using Apple MPS (Metal Performance Shaders)")
@@ -259,7 +265,7 @@ def train(config: dict):
     num_workers = config["training"].get(
         "num_workers_mac" if is_mac else "num_workers", 8
     )
-    use_amp = config["training"]["amp"] and device.type in ("cuda", "cpu")
+    use_amp = config["training"]["amp"] and device.type == "cuda"
 
     print(f"\n{'='*60}")
     print(f"NIH Chest X-ray14 — Training Pipeline")
@@ -272,6 +278,7 @@ def train(config: dict):
     print(f"{'='*60}\n")
 
     # ── Data ──
+    dp = config["data"]
     loaders = create_dataloaders(
         batch_size=batch_size,
         image_size=config["preprocessing"]["image_size"],
@@ -279,15 +286,12 @@ def train(config: dict):
         num_workers=num_workers,
         pin_memory=config["training"]["pin_memory"] and device.type == "cuda",
 
-        # Local mode
         use_streaming=False,
-        csv_path="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/Data_Entry_2017.csv",
-        image_dir="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/images",
-
-        # NEW: official split lists
+        csv_path=dp["csv_path"],
+        image_dir=dp["image_dir"],
         split_mode="official",
-        train_val_list="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/train_val_list.txt",
-        test_list="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/test_list.txt",
+        train_val_list=dp["train_val_list"],
+        test_list=dp["test_list"],
         seed=42,
     )
 
@@ -302,16 +306,12 @@ def train(config: dict):
     ).to(device)
 
     # ── Loss ──
-    # Compute class weights from training data
-
-
-    base = "/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest-x-ray"  # adjust if needed
     pos_weight = compute_pos_weight_from_csv(
-        csv_path="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/Data_Entry_2017.csv",
+        csv_path=dp["csv_path"],
         split_mode="official",
         split="train",
-        train_val_list="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/train_val_list.txt",
-        test_list="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/test_list.txt",
+        train_val_list=dp["train_val_list"],
+        test_list=dp["test_list"],
         seed=42,
     ).to(device)
     criterion = get_loss_function(
@@ -438,7 +438,7 @@ def train(config: dict):
                 "config": config,
                 "history": history,
             }, ckpt_path)
-            print(f"  ★ New best AUC: {best_auc:.4f} — saved to {ckpt_path}")
+            print(f"  >> New best AUC: {best_auc:.4f} -- saved to {ckpt_path}")
 
         # ── Early Stopping ──
         if early_stopping(val_metrics["auc_mean"]):

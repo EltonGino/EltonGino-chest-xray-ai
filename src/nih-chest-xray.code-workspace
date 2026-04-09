@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "nih-chest-xray",
+			"path": ".."
+		},
+		{
+			"name": "frontend",
+			"path": "../../../Downloads/bundle/frontend"
+		}
+	],
+	"settings": {}
+}

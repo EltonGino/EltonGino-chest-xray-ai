@@ -478,6 +478,11 @@ def main():
     parser.add_argument("--save-dir", type=str, default="outputs/evaluation")
     parser.add_argument("--gradcam", action="store_true")
     parser.add_argument("--num-gradcam", type=int, default=20)
+    # Data paths — override checkpoint config (required when running on a different machine)
+    parser.add_argument("--csv-path",       type=str, default=None)
+    parser.add_argument("--image-dir",      type=str, default=None)
+    parser.add_argument("--train-val-list", type=str, default=None)
+    parser.add_argument("--test-list",      type=str, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -494,24 +499,28 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])
     print(f"Loaded {config['model']['architecture']} from epoch {ckpt['epoch']}")
 
+    # Data paths: CLI args override, then checkpoint config, then relative defaults
+    dp = config.get("data", {})
+    csv_path       = args.csv_path       or dp.get("csv_path",       "data/NIH_chest_x-ray/Data_Entry_2017.csv")
+    image_dir      = args.image_dir      or dp.get("image_dir",      "data/NIH_chest_x-ray/images")
+    train_val_list = args.train_val_list or dp.get("train_val_list", "data/NIH_chest_x-ray/train_val_list.txt")
+    test_list      = args.test_list      or dp.get("test_list",      "data/NIH_chest_x-ray/test_list.txt")
+
     # Create test dataloader
     loaders = create_dataloaders(
-    batch_size=16,  # evaluation can be smaller to be safe
-    image_size=config["preprocessing"]["image_size"],
-    max_samples=None,
-    num_workers=2,
-    pin_memory=False,
-
-    # Local mode
-    use_streaming=False,
-    csv_path="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/Data_Entry_2017.csv",
-    image_dir="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/images",
-
-    split_mode="official",
-    train_val_list="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/train_val_list.txt",
-    test_list="/Volumes/ROG SSD/PyCharm/nih-chest-xray/data/NIH_chest_x-ray/test_list.txt",
-    seed=42,
-)
+        batch_size=16,
+        image_size=config["preprocessing"]["image_size"],
+        max_samples=None,
+        num_workers=2,
+        pin_memory=False,
+        use_streaming=False,
+        csv_path=csv_path,
+        image_dir=image_dir,
+        split_mode="official",
+        train_val_list=train_val_list,
+        test_list=test_list,
+        seed=42,
+    )
 
     # Full evaluation
     results = full_evaluation(

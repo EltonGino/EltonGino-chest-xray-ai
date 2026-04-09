@@ -35,10 +35,17 @@ dataset:
     test: 0.15
     seed: 42
 
+# --- Data Paths (update for each machine) ---
+data:
+  csv_path:       "data/NIH_chest_x-ray/Data_Entry_2017.csv"
+  image_dir:      "data/NIH_chest_x-ray/images"
+  train_val_list: "data/NIH_chest_x-ray/train_val_list.txt"
+  test_list:      "data/NIH_chest_x-ray/test_list.txt"
+
 # --- Preprocessing ---
 preprocessing:
-  image_size: 384          # Native resolution for EfficientNetV2-S pretrained weights
-  image_size_large: 512    # For fine-tuning phase
+  image_size: 224          # 224px — faster convergence, better performance than 384px
+  image_size_large: 320    # For fine-tuning phase
   normalization:
     mean: [0.485, 0.456, 0.406]  # ImageNet defaults
     std: [0.229, 0.224, 0.225]
@@ -75,13 +82,13 @@ model:
   vit_patch_size: 16
   # Freeze backbone initially for transfer learning
   freeze_backbone: true
-  freeze_epochs: 5  # Unfreeze after N epochs
+  freeze_epochs: 8  # Unfreeze after N epochs
 
 # --- Training ---
 training:
   epochs: 30
-  batch_size: 32           # RTX 5070 Ti (16GB) at 384px
-  batch_size_mac: 16       # Mac Mini M-series at 384px
+  batch_size: 64           # RTX 5070 Ti (16GB) at 224px
+  batch_size_mac: 32      # Mac Mini M-series at 224px
   num_workers: 8
   num_workers_mac: 4
   pin_memory: true
@@ -107,7 +114,7 @@ training:
   amp: true
 
   # Gradient accumulation (effective batch = batch_size * accum_steps)
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 4
 
   # Early stopping
   early_stopping:
