@@ -13,22 +13,22 @@ Trained on the full NIH ChestX-ray14 dataset (112,120 images, 30,805 patients) u
 
 | Class | AUC-ROC | AUC-PR | F1 | Prevalence |
 |---|---|---|---|---|
-| No Finding | 0.721 | 0.637 | 0.603 | 38.5% |
-| Atelectasis | 0.749 | 0.313 | 0.370 | 12.8% |
-| Cardiomegaly | 0.852 | 0.292 | 0.348 | 4.2% |
-| Effusion | 0.816 | 0.495 | 0.516 | 18.2% |
-| Infiltration | 0.691 | 0.389 | 0.478 | 23.9% |
-| Mass | 0.746 | 0.238 | 0.292 | 6.8% |
-| Nodule | 0.692 | 0.179 | 0.234 | 6.3% |
-| Pneumonia | 0.706 | 0.047 | 0.097 | 2.2% |
-| Pneumothorax | 0.834 | 0.368 | 0.428 | 10.4% |
-| Consolidation | 0.725 | 0.139 | 0.227 | 7.1% |
-| Edema | 0.827 | 0.133 | 0.208 | 3.6% |
-| Emphysema | 0.831 | 0.189 | 0.275 | 4.3% |
-| Fibrosis | 0.776 | 0.056 | 0.126 | 1.7% |
-| Pleural Thickening | 0.732 | 0.113 | 0.188 | 4.5% |
-| Hernia | 0.833 | 0.066 | 0.138 | 0.3% |
-| **Mean** | **0.769** | **0.244** | **0.302** | — |
+| No Finding | 0.714 | 0.627 | 0.599 | 38.5% |
+| Atelectasis | 0.739 | 0.297 | 0.359 | 12.8% |
+| Cardiomegaly | 0.816 | 0.248 | 0.306 | 4.2% |
+| Effusion | 0.805 | 0.480 | 0.508 | 18.2% |
+| Infiltration | 0.687 | 0.388 | 0.467 | 23.9% |
+| Mass | 0.729 | 0.192 | 0.254 | 6.8% |
+| Nodule | 0.691 | 0.170 | 0.231 | 6.3% |
+| Pneumonia | 0.679 | 0.042 | 0.084 | 2.2% |
+| Pneumothorax | 0.823 | 0.349 | 0.411 | 10.4% |
+| Consolidation | 0.716 | 0.133 | 0.219 | 7.1% |
+| Edema | 0.818 | 0.130 | 0.204 | 3.6% |
+| Emphysema | 0.813 | 0.175 | 0.255 | 4.3% |
+| Fibrosis | 0.777 | 0.060 | 0.118 | 1.7% |
+| Pleural Thickening | 0.732 | 0.107 | 0.182 | 4.5% |
+| Hernia | 0.838 | 0.058 | 0.122 | 0.3% |
+| **Mean** | **0.759** | **0.230** | **0.288** | — |
 
 **CheXNet (DenseNet-121) baseline: ~0.745 mean AUC** — Wang et al., CVPR 2017.
 
@@ -64,24 +64,27 @@ Classification Head
 
 | Phase | Epochs | Backbone | Head LR | Backbone LR |
 |---|---|---|---|---|
-| 1 — Transfer learning | 1–5 | Frozen | 1e-3 | — |
-| 2 — Fine-tuning | 6–30 | Unfrozen | 1e-4 | 1e-5 |
+| 1 — Transfer learning | 1–8 | Frozen | 1e-3 | — |
+| 2 — Fine-tuning | 9–30 | Unfrozen | 1e-4 | 1e-5 |
 
 - **Loss**: Asymmetric Loss (γ⁻=4.0, γ⁺=1.0) — better than Focal Loss for extreme multi-label imbalance
-- **Optimizer**: AdamW (weight decay 1e-2, effective batch 128 via gradient accumulation ×2)
+- **Optimizer**: AdamW (weight decay 1e-2, effective batch 256 via gradient accumulation ×4)
 - **Scheduler**: Cosine annealing with 3-epoch linear warmup
-- **AMP**: Mixed precision (bfloat16 on MPS / float16 on CUDA)
+- **AMP**: Mixed precision (float16 on CUDA)
 - **Early stopping**: patience 7 on val AUC-ROC
+- **Hardware**: RTX 5070 Ti (17GB VRAM) — ~2h10min for 30 epochs at 224px with batch 64
 
 ### Key Engineering Decisions
 
 **Official patient-level split** — Uses NIH's `train_val_list.txt` and `test_list.txt` with a binary patient-hash inner split (82/18) to prevent data leakage. Avoids the common mistake of random image splits where the same patient appears in train and test.
 
-**No Finding exclusivity** — The NIH labels are NLP-mined and contain ~2% noisy co-occurrences of "No Finding" with pathologies. Enforcing mutual exclusivity at label encoding fixed No Finding AUC from 0.492 → 0.721.
+**No Finding exclusivity** — The NIH labels are NLP-mined and contain ~2% noisy co-occurrences of "No Finding" with pathologies. Enforcing mutual exclusivity at label encoding fixed No Finding AUC from 0.492 → 0.714.
 
 **Anti-shortcut augmentations** — `AutoCropNonBlack` removes scanner borders, `CornerMask` randomly blacks out corners to prevent the model from learning burned-in text/markers as shortcuts rather than actual pathology features.
 
 **Asymmetric Loss over Focal + pos_weight** — Stacking both creates conflicting imbalance corrections. ASL handles positives and negatives with separate gamma values, no pos_weight needed.
+
+**224px over 384px** — Experiments at 384px (batch 32) underperformed 224px (batch 64). The smaller batch size at higher resolution hurt gradient quality more than the resolution gain helped. 224px with a larger batch converged faster and generalised better.
 
 ---
 
@@ -126,6 +129,11 @@ pip install fastapi uvicorn python-multipart opencv-python
 pip install pandas scikit-learn matplotlib seaborn pyyaml
 ```
 
+> **CUDA (Windows/Linux):** Replace the torch install with:
+> ```bash
+> pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+> ```
+
 ### 2. Download the dataset
 
 Download the NIH ChestX-ray14 dataset from [Kaggle](https://www.kaggle.com/datasets/nih-chest-xrays/data) and place it as:
@@ -140,7 +148,7 @@ data/NIH_chest_x-ray/
     └── ...
 ```
 
-Update the paths in `configs/config.yaml` to match your local setup.
+Update the `data:` paths in `configs/config.yaml` to match your local setup.
 
 ### 3. Train
 
@@ -148,7 +156,7 @@ Update the paths in `configs/config.yaml` to match your local setup.
 python -m src.train --config configs/config.yaml
 ```
 
-Full training on Mac Mini M-series (~10 hours) or RTX 5070 Ti (~2–3 hours at 224px).
+Approximate training time: ~2h10min on RTX 5070 Ti, ~8–10h on Mac Mini M-series (MPS).
 
 ### 4. Evaluate
 
@@ -156,6 +164,18 @@ Full training on Mac Mini M-series (~10 hours) or RTX 5070 Ti (~2–3 hours at 2
 python -m src.evaluate \
   --checkpoint checkpoints/best_model_efficientnet_v2_s.pt \
   --save-dir outputs/eval_full_run
+```
+
+If running evaluation on a different machine than where training happened, override the data paths:
+
+```bash
+python -m src.evaluate \
+  --checkpoint checkpoints/best_model_efficientnet_v2_s.pt \
+  --save-dir outputs/eval_full_run \
+  --csv-path "data/NIH_chest_x-ray/Data_Entry_2017.csv" \
+  --image-dir "data/NIH_chest_x-ray/images" \
+  --train-val-list "data/NIH_chest_x-ray/train_val_list.txt" \
+  --test-list "data/NIH_chest_x-ray/test_list.txt"
 ```
 
 ### 5. Run the inference demo
@@ -188,7 +208,7 @@ nih-chest-xray/
 │   ├── train.py         # Training loop, AMP, early stopping, checkpointing
 │   └── evaluate.py      # Per-class metrics, Grad-CAM, threshold optimization
 ├── configs/
-│   └── config.yaml      # Full training configuration
+│   └── config.yaml      # Full training configuration (update data: paths per machine)
 ├── frontend/
 │   ├── src/App.jsx      # React inference demo
 │   ├── index.html
@@ -203,8 +223,8 @@ nih-chest-xray/
 
 ## Limitations
 
-- **Resolution**: Trained at 224px. Diffuse interstitial patterns (Infiltration, Nodule) are the weakest classes and are known to benefit from higher input resolution.
 - **Label noise**: NIH labels are NLP-mined from radiology reports with ~10% estimated noise. Per-class performance reflects label quality as much as model quality.
+- **Weak classes**: Pneumonia (0.679) and Infiltration (0.687) are the hardest classes — both are diagnostically ambiguous and have the noisiest labels in CXR14.
 - **Not for clinical use**: This is a research/portfolio project. Predictions should not be used for medical diagnosis.
 - **Dataset shift**: Performance may degrade on images from scanners or acquisition protocols significantly different from the NIH dataset.
 

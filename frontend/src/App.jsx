@@ -544,7 +544,12 @@ function ReportPanel({ report }) {
       }} />
 
       {/* Report text */}
-      <div className="report-text">{displayed}</div>
+      <div
+        className="report-text"
+        dangerouslySetInnerHTML={{
+          __html: displayed.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        }}
+      />
 
       {/* Cursor */}
       {!done && (
