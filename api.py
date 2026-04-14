@@ -99,15 +99,12 @@ def _find_last_conv(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def _overlay_gradcam(
-    model: torch.nn.Module,
+    gradcam: GradCAM,
     image_tensor: torch.Tensor,
     original_pil: Image.Image,
     class_idx: int,
 ) -> str:
     """Generate heatmap overlay and return as base64-encoded PNG."""
-    last_conv = _find_last_conv(model)
-    gradcam   = GradCAM(model, last_conv)
-
     cam = gradcam.generate(image_tensor.unsqueeze(0), class_idx)
 
     # Resize CAM → image size
@@ -183,9 +180,14 @@ async def lifespan(app: FastAPI):
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(DEVICE).eval()
 
-    _state["model"] = model
-    _state["arch"]  = arch
-    _state["epoch"] = ckpt.get("epoch", "?")
+    # Build GradCAM once at startup — avoids registering new hooks on every request
+    last_conv = _find_last_conv(model)
+    gradcam   = GradCAM(model, last_conv)
+
+    _state["model"]    = model
+    _state["gradcam"]  = gradcam
+    _state["arch"]     = arch
+    _state["epoch"]    = ckpt.get("epoch", "?")
     _state["best_auc"] = ckpt.get("best_auc", 0.0)
     print(f"Model ready — arch={arch}, epoch={_state['epoch']}, best_auc={_state['best_auc']:.4f}")
     yield
@@ -238,7 +240,8 @@ async def predict(
     tfm    = build_transforms(tcfg, train=False)
     tensor = tfm(original_pil).to(DEVICE)
 
-    model: torch.nn.Module = _state["model"]
+    model:   torch.nn.Module = _state["model"]
+    gradcam: GradCAM         = _state["gradcam"]
 
     # ── Inference ──
     with torch.no_grad():
@@ -256,7 +259,7 @@ async def predict(
 
     if top_prob > 0.10:
         try:
-            gradcam_b64   = _overlay_gradcam(model, tensor, original_pil, top_idx)
+            gradcam_b64   = _overlay_gradcam(gradcam, tensor, original_pil, top_idx)
             gradcam_class = CLASS_NAMES[top_idx]
         except Exception as exc:
             print(f"[WARN] Grad-CAM failed: {exc}")

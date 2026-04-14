@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import axios from 'axios'
 
@@ -475,7 +475,7 @@ function ReportPanel({ report }) {
   const indexRef = useRef(0)
 
   // Typewriter effect
-  useState(() => {
+  useEffect(() => {
     if (!report) return
     indexRef.current = 0
     setDisplayed('')
@@ -491,7 +491,7 @@ function ReportPanel({ report }) {
     }, 12)
 
     return () => clearInterval(interval)
-  })
+  }, [report])
 
   return (
     <motion.div
@@ -631,11 +631,11 @@ export default function App() {
   const [error, setError]             = useState(null)
 
   // Fetch model info once
-  useState(() => {
+  useEffect(() => {
     axios.get('/health')
       .then(r => setModelInfo(r.data))
       .catch(() => {})
-  })
+  }, [])
 
   const handleUpload = useCallback(async (file) => {
     setImageFile(file)
