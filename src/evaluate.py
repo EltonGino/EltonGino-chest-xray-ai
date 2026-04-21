@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.optimize import minimize_scalar
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score,
     precision_score, recall_score, roc_curve,
@@ -86,24 +87,34 @@ def full_evaluation(
     device: torch.device,
     thresholds: Optional[np.ndarray] = None,
     save_dir: Optional[str] = None,
+    precomputed_probs: Optional[np.ndarray] = None,
+    precomputed_targets: Optional[np.ndarray] = None,
 ) -> Dict:
     """
     Full evaluation pipeline with all clinically relevant metrics.
+
+    Pass precomputed_probs / precomputed_targets to skip inference
+    (used by the TTA path).
     """
-    model.eval()
-    all_logits = []
-    all_targets = []
+    if precomputed_probs is not None and precomputed_targets is not None:
+        all_probs   = precomputed_probs
+        all_targets = precomputed_targets
+    else:
+        from tqdm import tqdm
+        model.eval()
+        all_logits  = []
+        all_targets = []
 
-    with torch.no_grad():
-        for images, labels in dataloader:
-            images = images.to(device)
-            logits = model(images)
-            all_logits.append(logits.cpu())
-            all_targets.append(labels.cpu())
+        with torch.no_grad():
+            for images, labels in tqdm(dataloader, desc="Evaluating"):
+                images = images.to(device)
+                logits = model(images)
+                all_logits.append(logits.cpu())
+                all_targets.append(labels.cpu())
 
-    all_logits = torch.cat(all_logits).numpy()
-    all_targets = torch.cat(all_targets).numpy()
-    all_probs = 1 / (1 + np.exp(-all_logits))  # Sigmoid
+        all_logits  = torch.cat(all_logits).numpy()
+        all_targets = torch.cat(all_targets).numpy()
+        all_probs   = 1 / (1 + np.exp(-all_logits))  # Sigmoid
 
     # Optimize thresholds if not provided
     if thresholds is None:
@@ -470,14 +481,368 @@ def compare_models(results_dict: Dict[str, Dict], save_path: str = "outputs/mode
     print(f"Model comparison saved to {save_path}")
 
 
+# ── Test-Time Augmentation ────────────────────────────────────────────────
+
+def tta_predict(
+    model: nn.Module,
+    dataloader,
+    device: torch.device,
+    n_augments: int = 6,
+    image_size: int = 224,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Test-Time Augmentation: run multiple augmented passes and average logits.
+
+    Augmentations applied per pass (randomly sampled):
+      - Horizontal flip
+      - Small rotation (±10°)
+      - Slight scale crop (85–100%)
+    The original unaugmented pass is always included as pass 0.
+
+    Args:
+        model:       eval-mode model
+        dataloader:  test DataLoader (no augmentation applied by dataset)
+        device:      torch device
+        n_augments:  number of additional augmented passes (total = n_augments + 1)
+        image_size:  expected input resolution
+
+    Returns:
+        probs   (N, C) averaged probabilities
+        targets (N, C) ground-truth labels
+    """
+    from torchvision import transforms as T
+
+    # No horizontal flip — CXR has clinically significant laterality
+    # (cardiac apex, gastric bubble, effusion side, pneumothorax side).
+    aug_transform = T.Compose([
+        T.RandomRotation(degrees=5),
+        T.RandomResizedCrop(image_size, scale=(0.90, 1.0), ratio=(0.95, 1.05)),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Inverse-normalize to get back to [0,1] tensors before re-augmenting
+    _inv_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    _inv_std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+    from tqdm import tqdm
+
+    model.eval()
+    all_logits_sum = []
+    all_targets    = []
+
+    total_passes = n_augments + 1
+
+    # Pass 0 — original (no augmentation)
+    with torch.no_grad():
+        for images, labels in tqdm(dataloader, desc=f"TTA pass 1/{total_passes} (original)", leave=False):
+            images = images.to(device)
+            logits = model(images).cpu()
+            all_logits_sum.append(logits)
+            all_targets.append(labels)
+
+    all_logits_sum = [t.clone() for t in all_logits_sum]
+
+    # Passes 1..n_augments — augmented
+    for aug_idx in range(n_augments):
+        batch_logits = []
+        with torch.no_grad():
+            for images, _ in tqdm(dataloader, desc=f"TTA pass {aug_idx + 2}/{total_passes} (augmented)", leave=False):
+                # Undo ImageNet normalisation → [0,1], apply aug, re-normalise
+                imgs_01 = (images * _inv_std + _inv_mean).clamp(0, 1)
+                imgs_aug = torch.stack([aug_transform(img) for img in imgs_01])
+                imgs_aug = imgs_aug.to(device)
+                batch_logits.append(model(imgs_aug).cpu())
+
+        for j, bl in enumerate(batch_logits):
+            all_logits_sum[j] = all_logits_sum[j] + bl
+
+    total_passes = n_augments + 1
+    all_logits_avg = [l / total_passes for l in all_logits_sum]
+    all_logits_np  = torch.cat(all_logits_avg).numpy()
+    all_targets_np = torch.cat(all_targets).numpy()
+    all_probs      = 1 / (1 + np.exp(-all_logits_np))
+
+    return all_probs, all_targets_np
+
+
+# ── Calibration ───────────────────────────────────────────────────────────
+
+def compute_ece(
+    targets: np.ndarray,
+    probs: np.ndarray,
+    n_bins: int = 10,
+) -> Dict[str, float]:
+    """
+    Expected Calibration Error for each class and overall mean.
+
+    Args:
+        targets: (N, C) binary ground-truth array
+        probs:   (N, C) predicted probabilities
+        n_bins:  number of equal-width bins in [0, 1]
+
+    Returns:
+        dict with per-class ECE values and "mean_ece"
+    """
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece_per_class: Dict[str, float] = {}
+
+    for i, cls in enumerate(CLASS_NAMES):
+        p = probs[:, i]
+        t = targets[:, i]
+        ece = 0.0
+        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+            mask = (p >= lo) & (p < hi)
+            if mask.sum() == 0:
+                continue
+            avg_conf = p[mask].mean()
+            avg_acc  = t[mask].mean()
+            ece += (mask.sum() / len(p)) * abs(avg_conf - avg_acc)
+        ece_per_class[cls] = round(float(ece), 6)
+
+    ece_per_class["mean_ece"] = round(float(np.mean(list(ece_per_class.values()))), 6)
+    return ece_per_class
+
+
+def find_temperature(
+    val_logits: np.ndarray,
+    val_targets: np.ndarray,
+) -> float:
+    """
+    Find the optimal scalar temperature T that minimises binary cross-entropy
+    on the validation set (temperature scaling / Platt scaling for multi-label).
+
+    Args:
+        val_logits: (N, C) raw model logits (before sigmoid)
+        val_targets: (N, C) binary ground-truth
+
+    Returns:
+        Optimal temperature T  (> 1 means model is over-confident)
+    """
+    logits_t = torch.tensor(val_logits, dtype=torch.float32)
+    targets_t = torch.tensor(val_targets, dtype=torch.float32)
+    bce = nn.BCEWithLogitsLoss()
+
+    def nll(T: float) -> float:
+        return bce(logits_t / T, targets_t).item()
+
+    result = minimize_scalar(nll, bounds=(0.01, 10.0), method="bounded")
+    return float(result.x)
+
+
+def plot_reliability_diagrams(
+    targets: np.ndarray,
+    probs_before: np.ndarray,
+    probs_after: np.ndarray,
+    temperature: float,
+    save_path: str,
+    n_bins: int = 10,
+) -> None:
+    """
+    Plot per-class reliability diagrams (before vs after temperature scaling).
+    Each subplot: diagonal = perfect calibration, bars = actual accuracy per bin.
+    """
+    n_cols = 5
+    n_rows = -(-NUM_CLASSES // n_cols)  # ceiling division
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, n_rows * 4))
+    axes = axes.flatten()
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+
+    for i, cls in enumerate(CLASS_NAMES):
+        ax = axes[i]
+        for probs, label, color in [
+            (probs_before, "Before (T=1.0)", "#4878CF"),
+            (probs_after,  f"After  (T={temperature:.2f})", "#E8625A"),
+        ]:
+            p = probs[:, i]
+            t = targets[:, i]
+            accs, confs = [], []
+            for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+                mask = (p >= lo) & (p < hi)
+                if mask.sum() == 0:
+                    accs.append(np.nan)
+                    confs.append((lo + hi) / 2)
+                else:
+                    accs.append(t[mask].mean())
+                    confs.append(p[mask].mean())
+            ax.plot(confs, accs, marker="o", markersize=4, label=label, color=color)
+
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.5)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title(cls, fontsize=9, fontweight="bold")
+        ax.set_xlabel("Confidence", fontsize=7)
+        ax.set_ylabel("Accuracy", fontsize=7)
+        ax.tick_params(labelsize=7)
+        if i == 0:
+            ax.legend(fontsize=7)
+
+    # Hide unused subplots
+    for j in range(len(CLASS_NAMES), len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle(
+        f"Reliability Diagrams — Temperature Scaling (T={temperature:.3f})\n"
+        "NIH Chest X-ray14",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Reliability diagrams saved to {save_path}")
+
+
+def run_calibration(
+    model: nn.Module,
+    val_loader,
+    test_loader,
+    device: torch.device,
+    save_dir: str,
+) -> None:
+    """
+    Full calibration pipeline:
+      1. Collect val logits + ground truth
+      2. Fit temperature T on val set
+      3. Collect test probs before/after scaling
+      4. Compute ECE before/after
+      5. Plot reliability diagrams
+      6. Print summary table
+    """
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    model.eval()
+
+    def _collect(loader):
+        all_logits, all_probs, all_targets = [], [], []
+        with torch.no_grad():
+            for imgs, labels in loader:
+                imgs = imgs.to(device)
+                logits = model(imgs)
+                probs  = torch.sigmoid(logits).cpu()
+                all_logits.append(logits.cpu().numpy())
+                all_probs.append(probs.numpy())
+                all_targets.append(labels.numpy())
+        return (
+            np.concatenate(all_logits),
+            np.concatenate(all_probs),
+            np.concatenate(all_targets),
+        )
+
+    print("Collecting val set predictions for temperature fitting...")
+    val_logits, _, val_targets = _collect(val_loader)
+
+    print("Fitting temperature on validation set...")
+    T = find_temperature(val_logits, val_targets)
+    print(f"  Optimal temperature: T = {T:.4f}")
+
+    print("Collecting test set predictions...")
+    test_logits, test_probs_before, test_targets = _collect(test_loader)
+    test_probs_after = torch.sigmoid(torch.tensor(test_logits) / T).numpy()
+
+    ece_before = compute_ece(test_targets, test_probs_before)
+    ece_after  = compute_ece(test_targets, test_probs_after)
+
+    # Print summary
+    print(f"\n{'Class':<22} {'ECE before':>12} {'ECE after':>12} {'Delta':>10}")
+    print("-" * 58)
+    for cls in CLASS_NAMES:
+        eb = ece_before[cls]
+        ea = ece_after[cls]
+        print(f"  {cls:<20} {eb:>12.4f} {ea:>12.4f} {ea - eb:>+10.4f}")
+    print("-" * 58)
+    print(f"  {'Mean':<20} {ece_before['mean_ece']:>12.4f} {ece_after['mean_ece']:>12.4f} "
+          f"{ece_after['mean_ece'] - ece_before['mean_ece']:>+10.4f}")
+
+    # Reliability diagrams
+    plot_reliability_diagrams(
+        test_targets,
+        test_probs_before,
+        test_probs_after,
+        temperature=T,
+        save_path=f"{save_dir}/reliability_diagrams.png",
+    )
+
+    # Save temperature to file for later use in api.py / inference
+    import json
+    cal_path = f"{save_dir}/calibration.json"
+    with open(cal_path, "w") as f:
+        json.dump({"temperature": T, "ece_before": ece_before, "ece_after": ece_after}, f, indent=2)
+    print(f"Calibration results saved to {cal_path}")
+
+
+# ── Ensemble ──────────────────────────────────────────────────────────────
+
+def ensemble_predict(
+    checkpoint_paths: list,
+    dataloader,
+    device: torch.device,
+    n_augments: int = 6,
+    image_size: int = 224,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load multiple checkpoints, run TTA on each, average probabilities.
+
+    Each model contributes equally (simple average). Simple averaging
+    outperforms weighted averaging unless you have a held-out set to
+    optimise weights — which would risk overfitting on 15 classes.
+
+    Args:
+        checkpoint_paths: list of .pt checkpoint paths
+        dataloader:       test DataLoader
+        device:           torch device
+        n_augments:       TTA augmented passes per model
+        image_size:       input resolution
+
+    Returns:
+        probs   (N, C) averaged probabilities
+        targets (N, C) ground-truth labels (from first model pass)
+    """
+    all_model_probs = []
+    targets = None
+
+    for i, ckpt_path in enumerate(checkpoint_paths):
+        print(f"\n[{i+1}/{len(checkpoint_paths)}] Loading {ckpt_path} ...")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        arch = ckpt["config"]["model"]["architecture"]
+
+        model = build_model(arch=arch, pretrained=False, freeze_backbone=False).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"    arch={arch}, epoch={ckpt['epoch']}, val_auc={ckpt.get('best_auc', 0):.4f}")
+
+        probs, tgts = tta_predict(model, dataloader, device,
+                                  n_augments=n_augments, image_size=image_size)
+        all_model_probs.append(probs)
+
+        if targets is None:
+            targets = tgts
+
+        # Free VRAM between models
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    ensemble_probs = np.mean(all_model_probs, axis=0)
+    return ensemble_probs, targets
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Single checkpoint path (use --ensemble for multiple)")
+    parser.add_argument("--ensemble", type=str, nargs="+", default=None,
+                        help="Two or more checkpoint paths to ensemble")
     parser.add_argument("--save-dir", type=str, default="outputs/evaluation")
     parser.add_argument("--gradcam", action="store_true")
     parser.add_argument("--num-gradcam", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Batch size for evaluation (default: 64)")
+    parser.add_argument("--tta", action="store_true",
+                        help="Use Test-Time Augmentation (6 augmented passes + original)")
+    parser.add_argument("--tta-passes", type=int, default=6,
+                        help="Number of augmented TTA passes (default: 6)")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run temperature scaling calibration analysis")
     # Data paths — override checkpoint config (required when running on a different machine)
     parser.add_argument("--csv-path",       type=str, default=None)
     parser.add_argument("--image-dir",      type=str, default=None)
@@ -485,19 +850,21 @@ def main():
     parser.add_argument("--test-list",      type=str, default=None)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Device: {device}")
 
-    # Load checkpoint
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if not args.checkpoint and not args.ensemble:
+        parser.error("Either --checkpoint or --ensemble is required.")
+
+    # Load primary checkpoint for config/data-path resolution
+    primary_ckpt_path = args.checkpoint or args.ensemble[0]
+    ckpt = torch.load(primary_ckpt_path, map_location=device, weights_only=False)
     config = ckpt["config"]
-
-    model = build_model(
-        arch=config["model"]["architecture"],
-        pretrained=False,
-        freeze_backbone=False,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    print(f"Loaded {config['model']['architecture']} from epoch {ckpt['epoch']}")
 
     # Data paths: CLI args override, then checkpoint config, then relative defaults
     dp = config.get("data", {})
@@ -506,13 +873,12 @@ def main():
     train_val_list = args.train_val_list or dp.get("train_val_list", "data/NIH_chest_x-ray/train_val_list.txt")
     test_list      = args.test_list      or dp.get("test_list",      "data/NIH_chest_x-ray/test_list.txt")
 
-    # Create test dataloader
     loaders = create_dataloaders(
-        batch_size=16,
+        batch_size=args.batch_size,
         image_size=config["preprocessing"]["image_size"],
         max_samples=None,
-        num_workers=2,
-        pin_memory=False,
+        num_workers=4,
+        pin_memory=device.type == "cuda",
         use_streaming=False,
         csv_path=csv_path,
         image_dir=image_dir,
@@ -522,10 +888,60 @@ def main():
         seed=42,
     )
 
-    # Full evaluation
-    results = full_evaluation(
-        model, loaders["test"], device, save_dir=args.save_dir,
-    )
+    # ── Ensemble mode ──
+    if args.ensemble:
+        print(f"\nEnsemble mode: {len(args.ensemble)} models")
+        ensemble_probs, ensemble_targets = ensemble_predict(
+            checkpoint_paths=args.ensemble,
+            dataloader=loaders["test"],
+            device=device,
+            n_augments=args.tta_passes,
+            image_size=config["preprocessing"]["image_size"],
+        )
+        thresholds = optimize_thresholds(ensemble_targets, ensemble_probs, metric="f1")
+        # Load any model for the full_evaluation signature (not used for inference)
+        model = build_model(
+            arch=config["model"]["architecture"], pretrained=False, freeze_backbone=False,
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        results = full_evaluation(
+            model, loaders["test"], device,
+            thresholds=thresholds,
+            save_dir=args.save_dir,
+            precomputed_probs=ensemble_probs,
+            precomputed_targets=ensemble_targets,
+        )
+
+    # ── Single model mode ──
+    else:
+        model = build_model(
+            arch=config["model"]["architecture"],
+            pretrained=False,
+            freeze_backbone=False,
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"Loaded {config['model']['architecture']} from epoch {ckpt['epoch']}")
+
+        if args.tta:
+            image_size = config["preprocessing"]["image_size"]
+            print(f"Running TTA ({args.tta_passes} augmented passes + original)...")
+            tta_probs, tta_targets = tta_predict(
+                model, loaders["test"], device,
+                n_augments=args.tta_passes,
+                image_size=image_size,
+            )
+            thresholds = optimize_thresholds(tta_targets, tta_probs, metric="f1")
+            results = full_evaluation(
+                model, loaders["test"], device,
+                thresholds=thresholds,
+                save_dir=args.save_dir,
+                precomputed_probs=tta_probs,
+                precomputed_targets=tta_targets,
+            )
+        else:
+            results = full_evaluation(
+                model, loaders["test"], device, save_dir=args.save_dir,
+            )
 
     # Grad-CAM
     if args.gradcam:
@@ -534,6 +950,19 @@ def main():
             num_samples=args.num_gradcam,
             save_dir=f"{args.save_dir}/gradcam",
         )
+
+    # Calibration analysis
+    if args.calibrate:
+        if "val" not in loaders:
+            print("[WARN] Val loader not available — skipping calibration.")
+        else:
+            run_calibration(
+                model,
+                val_loader=loaders["val"],
+                test_loader=loaders["test"],
+                device=device,
+                save_dir=f"{args.save_dir}/calibration",
+            )
 
 
 if __name__ == "__main__":

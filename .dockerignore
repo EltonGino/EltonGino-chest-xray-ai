@@ -1,0 +1,11 @@
+.venv/
+data/
+frontend/
+tests/
+outputs/
+.git/
+__pycache__/
+*.pyc
+*.pt
+*.pth
+.DS_Store

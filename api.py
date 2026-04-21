@@ -9,8 +9,11 @@ Author: Elton Gino Santos
 """
 
 import io
+import os
+import json
 import base64
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -122,10 +125,10 @@ def _overlay_gradcam(
     return base64.b64encode(buf.getvalue()).decode()
 
 
-# ── Radiology Report (Claude) ────────────────────────────────────────────────
+# ── Radiology Report (Ollama) ────────────────────────────────────────────────
 
-OLLAMA_URL   = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:latest"
+OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://localhost:11434") + "/api/generate"
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:latest")
 
 
 def _generate_report(predictions: dict[str, float]) -> str:
@@ -184,11 +187,26 @@ async def lifespan(app: FastAPI):
     last_conv = _find_last_conv(model)
     gradcam   = GradCAM(model, last_conv)
 
-    _state["model"]    = model
-    _state["gradcam"]  = gradcam
-    _state["arch"]     = arch
-    _state["epoch"]    = ckpt.get("epoch", "?")
-    _state["best_auc"] = ckpt.get("best_auc", 0.0)
+    # Load temperature from calibration file if available
+    temperature = 1.0
+    for candidate in [
+        Path("outputs/eval_full_run/calibration/calibration.json"),
+        Path("outputs/evaluation/calibration/calibration.json"),
+    ]:
+        if candidate.exists():
+            cal_data = json.loads(candidate.read_text())
+            temperature = float(cal_data.get("temperature", 1.0))
+            print(f"Loaded temperature T={temperature:.4f} from {candidate}")
+            break
+    else:
+        print("No calibration.json found — using T=1.0 (uncalibrated)")
+
+    _state["model"]       = model
+    _state["gradcam"]     = gradcam
+    _state["arch"]        = arch
+    _state["epoch"]       = ckpt.get("epoch", "?")
+    _state["best_auc"]    = ckpt.get("best_auc", 0.0)
+    _state["temperature"] = temperature
     print(f"Model ready — arch={arch}, epoch={_state['epoch']}, best_auc={_state['best_auc']:.4f}")
     yield
     _state.clear()
@@ -240,13 +258,14 @@ async def predict(
     tfm    = build_transforms(tcfg, train=False)
     tensor = tfm(original_pil).to(DEVICE)
 
-    model:   torch.nn.Module = _state["model"]
-    gradcam: GradCAM         = _state["gradcam"]
+    model:       torch.nn.Module = _state["model"]
+    gradcam:     GradCAM         = _state["gradcam"]
+    temperature: float           = _state.get("temperature", 1.0)
 
     # ── Inference ──
     with torch.no_grad():
         logits = model(tensor.unsqueeze(0))
-        probs  = torch.sigmoid(logits)[0].cpu()
+        probs  = torch.sigmoid(logits / temperature)[0].cpu()
 
     predictions = {CLASS_NAMES[i]: round(float(probs[i]), 4) for i in range(NUM_CLASSES)}
 

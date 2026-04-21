@@ -28,6 +28,11 @@ from typing import Optional, Dict
 import yaml
 import numpy as np
 import torch
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 from contextlib import nullcontext
 import torch.nn as nn
 from torch.optim import AdamW
@@ -95,9 +100,11 @@ def train_one_epoch(
     all_logits = []
     all_targets = []
 
+    from tqdm import tqdm
+
     optimizer.zero_grad()
 
-    for step, (images, labels) in enumerate(dataloader):
+    for step, (images, labels) in enumerate(tqdm(dataloader, desc="  train", leave=False)):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -173,7 +180,9 @@ def validate(
     all_logits = []
     all_targets = []
 
-    for images, labels in dataloader:
+    from tqdm import tqdm
+
+    for images, labels in tqdm(dataloader, desc="  val  ", leave=False):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -276,6 +285,16 @@ def train(config: dict):
     print(f"Mixed precision: {use_amp}")
     print(f"Device: {device}")
     print(f"{'='*60}\n")
+
+    # W&B init
+    use_wandb = config["logging"].get("use_wandb", False) and WANDB_AVAILABLE
+    if use_wandb:
+        wandb.init(
+            project=config["logging"]["project_name"],
+            config=config,
+            name=f"{config['model']['architecture']}_224px",
+        )
+        print("W&B run initialized.")
 
     # ── Data ──
     dp = config["data"]
@@ -425,6 +444,22 @@ def train(config: dict):
         history["val_f1"].append(val_metrics["f1_mean"])
         history["lr"].append(optimizer.param_groups[0]["lr"])
 
+        if use_wandb:
+            log = {
+                "epoch": epoch,
+                "train/loss": train_metrics["loss"],
+                "train/auc_mean": train_metrics["auc_mean"],
+                "val/loss": val_metrics["loss"],
+                "val/auc_mean": val_metrics["auc_mean"],
+                "val/f1_mean": val_metrics["f1_mean"],
+                "val/ap_mean": val_metrics["ap_mean"],
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+            # Per-class val AUC
+            for name, auc in zip(CLASS_NAMES, val_metrics["aucs"]):
+                log[f"val/auc_{name.lower().replace(' ', '_')}"] = auc
+            wandb.log(log)
+
         # ── Checkpointing ──
         if val_metrics["auc_mean"] > best_auc:
             best_auc = val_metrics["auc_mean"]
@@ -448,6 +483,10 @@ def train(config: dict):
     print(f"\n{'='*60}")
     print(f"Training complete! Best AUC: {best_auc:.4f}")
     print(f"{'='*60}")
+
+    if use_wandb:
+        wandb.summary["best_val_auc"] = best_auc
+        wandb.finish()
 
     return model, history
 

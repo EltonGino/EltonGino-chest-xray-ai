@@ -1,0 +1,26 @@
+services:
+
+  ollama:
+    image: ollama/ollama
+    container_name: cxr_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: cxr_api
+    volumes:
+      - ./checkpoints:/app/checkpoints:ro
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

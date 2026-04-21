@@ -1,34 +1,14 @@
 # ============================================================================
-# NIH Chest X-ray14 — Multi-Label Classification Pipeline
-# Configuration File
+# NIH Chest X-ray14 — ConvNeXt-Base Training Config
 # ============================================================================
 
 # --- Dataset ---
 dataset:
   name: "alkzar90/NIH-Chest-X-ray-dataset"
   subset: "image-classification"
-  num_classes: 15  # 14 diseases + No Finding
-  class_names:
-    - "No Finding"
-    - "Atelectasis"
-    - "Cardiomegaly"
-    - "Effusion"
-    - "Infiltration"
-    - "Mass"
-    - "Nodule"
-    - "Pneumonia"
-    - "Pneumothorax"
-    - "Consolidation"
-    - "Edema"
-    - "Emphysema"
-    - "Fibrosis"
-    - "Pleural_Thickening"
-    - "Hernia"
-  # Use streaming to avoid downloading ~45GB upfront
+  num_classes: 15
   streaming: false
-  # Number of samples to buffer for streaming (adjust based on RAM)
   stream_buffer_size: 10000
-  # Patient-level split to prevent data leakage
   patient_split:
     train: 0.82
     val: 0.15
@@ -44,12 +24,11 @@ data:
 
 # --- Preprocessing ---
 preprocessing:
-  image_size: 224          # 224px — faster convergence, better performance than 384px
-  image_size_large: 320    # For fine-tuning phase
+  image_size: 224
+  image_size_large: 320
   normalization:
-    mean: [0.485, 0.456, 0.406]  # ImageNet defaults
+    mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
-  # CXR-specific: images are grayscale, replicate to 3 channels
   grayscale_to_rgb: true
 
 # --- Augmentation ---
@@ -72,31 +51,26 @@ augmentation:
 
 # --- Model ---
 model:
-  # Options: "efficientnet_v2_s", "efficientnet_v2_m", "convnext_tiny",
-  #          "convnext_small", "vit_base_patch16_224", "vit_small_patch16_224"
-  architecture: "efficientnet_v2_s"
+  architecture: "convnext_base"
   pretrained: true
   drop_rate: 0.3
-  drop_path_rate: 0.2
-  # For ViT models
-  vit_patch_size: 16
-  # Freeze backbone initially for transfer learning
+  drop_path_rate: 0.4        # Larger model — higher stochastic depth for regularization
   freeze_backbone: true
-  freeze_epochs: 8  # Unfreeze after N epochs
+  freeze_epochs: 8
 
 # --- Training ---
 training:
-  epochs: 30
-  batch_size: 64           # RTX 5070 Ti (16GB) at 224px
-  batch_size_mac: 32      # Mac Mini M-series at 224px
+  epochs: 60
+  batch_size: 64             # RTX 5070 Ti (17GB) at 224px — fits with AMP
+  batch_size_mac: 16         # ConvNeXt-Base is 89M params, reduce for MPS
   num_workers: 8
   num_workers_mac: 4
   pin_memory: true
 
   # Optimizer
   optimizer: "adamw"
-  learning_rate: 1.0e-3       # Head LR (frozen backbone phase)
-  backbone_lr: 1.0e-5         # Backbone LR (after unfreeze)
+  learning_rate: 1.0e-3
+  backbone_lr: 1.0e-5
   weight_decay: 0.01
   betas: [0.9, 0.999]
 
@@ -104,21 +78,21 @@ training:
   scheduler: "cosine_warmup"
   warmup_epochs: 3
   min_lr: 1.0e-7
-  
+
   # Loss
-  loss: "asymmetric"  # Options: "bce", "focal", "asymmetric"
+  loss: "asymmetric"
   focal_gamma: 2.0
   focal_alpha: 0.25
 
   # Mixed precision
   amp: true
 
-  # Gradient accumulation (effective batch = batch_size * accum_steps)
+  # Gradient accumulation (effective batch = 64 * 4 = 256)
   gradient_accumulation_steps: 4
 
   # Early stopping
   early_stopping:
-    patience: 7
+    patience: 10
     metric: "val_auc_mean"
     mode: "max"
 
@@ -128,18 +102,13 @@ training:
 
 # --- Evaluation ---
 evaluation:
-  # Per-class threshold optimization on validation set
   optimize_thresholds: true
-  threshold_metric: "f1"  # Optimize F1 per class
+  threshold_metric: "f1"
   default_threshold: 0.5
-  
-  # Grad-CAM visualization
   gradcam:
     enabled: true
-    target_layers: "auto"  # Auto-detect last conv layer
+    target_layers: "auto"
     num_samples: 50
-
-  # Metrics to track
   metrics:
     - "auc_roc"
     - "auc_pr"
@@ -158,8 +127,6 @@ logging:
 
 # --- Hardware ---
 hardware:
-  # Auto-detect: cuda > mps > cpu
   accelerator: "auto"
-  # For multi-GPU (if available)
   strategy: "auto"
-  precision: "16-mixed"      # bf16-mixed on Ampere+
+  precision: "16-mixed"
