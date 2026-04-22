@@ -4,83 +4,74 @@
 Multi-label chest X-ray pathology classifier trained on NIH ChestX-ray14 (112k images, 15 classes).
 Full-stack demo: FastAPI backend + React frontend + Grad-CAM + Ollama radiology reports.
 
-**Current best checkpoint:** `checkpoints/best_model_efficientnet_v2_s.pt`
-- Architecture: EfficientNetV2-S, 224px, batch 64
-- Val AUC: 0.7859 (epoch 28)
-- Test AUC: 0.7585 (mean across 15 classes)
-- Trained on: RTX 5070 Ti via SSH from Mac Mini
+**Current best result: 0.793 mean AUC (Ensemble + TTA)**
+| Checkpoint | Val AUC | Test AUC | Epoch |
+|---|---|---|---|
+| `checkpoints/best_model_efficientnet_v2_s.pt` | 0.7859 | 0.7585 | 28 |
+| `checkpoints/best_model_convnext_base.pt`     | 0.8199 | 0.770  | 54 |
+| **Ensemble + TTA (7 passes)**                 | —      | **0.793** | — |
 
 ---
 
-## Roadmap to Senior Level
+## Completed Roadmap
 
-### Priority 1 — Fix open bugs ✅ DONE
-- [x] **Grad-CAM hook memory leak** (`api.py`) — GradCAM now instantiated once at startup in `_state`, reused across all requests.
-- [x] **`useState` used as `useEffect`** (`frontend/src/App.jsx`) — both `ReportPanel` typewriter and health check converted to `useEffect` with correct dependency arrays.
+### Priority 1 — Fix open bugs ✅
+- Grad-CAM hook memory leak — GradCAM instantiated once at startup, reused per request
+- `useState` used as `useEffect` in `App.jsx` — fixed with correct dependency arrays
 
-### Priority 2 — Experiment tracking (W&B) ✅ DONE
-- [x] Enabled W&B in `configs/config.yaml`
-- [x] Added W&B init with full config logged as run config
-- [x] Per-epoch logging: train/val loss, mean AUC, F1, AP, LR, per-class val AUC
-- [x] `wandb.summary["best_val_auc"]` set at end of training
-- [x] Graceful fallback if wandb not installed (`WANDB_AVAILABLE` flag)
+### Priority 2 — Experiment tracking (W&B) ✅
+- Per-epoch W&B logging: train/val loss, mean AUC, F1, AP, LR, per-class val AUC
+- `wandb.summary["best_val_auc"]` set at end of training; graceful fallback if W&B absent
 
-### Priority 3 — Push AUC above 0.80
-- [x] TTA implemented — `tta_predict()` in `evaluate.py`, 6 augmented passes + original, `--tta` flag
-- [ ] Run ConvNeXt-Small (`convnext_small` already supported in `src/models.py`) — requires retraining
-- [ ] Ensemble EfficientNetV2-S + ConvNeXt-Small predictions — requires ConvNeXt checkpoint first
+### Priority 3 — Push AUC above 0.80 ✅ (val: 0.820, test: 0.793)
+- TTA: `tta_predict()` in `evaluate.py`, 7 passes, no horizontal flip (CXR laterality)
+- ConvNeXt-Base trained 60 epochs, patience 10 — val AUC 0.8199 at epoch 54
+- Ensemble: `ensemble_predict()` in `evaluate.py`, averages probabilities across both models
+- `api.py` updated to load both checkpoints at startup, average predictions at inference
 
-### Priority 4 — Unit tests ✅ DONE
-- [x] 29 tests in `tests/test_dataset.py`, all passing
-- [x] `encode_findings` — encoding, No Finding exclusivity, unknown labels, all 15 classes
-- [x] `patient_hash_split` — determinism, valid outputs, seed sensitivity, distribution
-- [x] `patient_hash_split_binary` — determinism, no test split, full coverage, no overlap, distribution
-- [x] `_filter_df_by_split` — no patient overlap, full coverage, determinism, invalid input errors
-- [x] `compute_pos_weight_from_csv` — shape, dtype, all positive, clamped at 50, no NaN/Inf
-- Run with: `pytest tests/ -v`
+### Priority 4 — Unit tests ✅
+- 29 tests in `tests/test_dataset.py` — encode_findings, patient splits, pos_weight
+- GitHub Actions CI: `.github/workflows/tests.yml` runs pytest on every push
 
-### Priority 5 — Docker ✅ DONE
-- [x] `Dockerfile` — Python 3.12-slim, CPU torch, checkpoint mounted as volume
-- [x] `docker-compose.yml` — api + ollama services, OLLAMA_URL wired between containers
-- [x] `.dockerignore` — excludes data/, .venv/, checkpoints/, frontend/
-- [x] `OLLAMA_URL` in `api.py` now reads from env var (defaults to localhost for local dev)
-- Run with: `docker compose up --build`
+### Priority 5 — Docker ✅
+- `Dockerfile` (Python 3.12-slim, CPU torch, checkpoint mounted as volume)
+- `docker-compose.yml` (api + ollama services, OLLAMA_URL wired)
+- `.dockerignore` excludes data/, .venv/, checkpoints/, frontend/
 
-### Priority 6 — Model calibration analysis ✅ DONE
-- [x] `compute_ece()` — ECE per class and mean, equal-width bins
-- [x] `find_temperature()` — scalar temperature via minimize_scalar on val BCE
-- [x] `plot_reliability_diagrams()` — 15-panel grid, before vs after temp scaling
-- [x] `run_calibration()` — full pipeline, saves `calibration.json` (T + ECE scores)
-- [x] `--calibrate` flag wired into `main()` in `evaluate.py`
-- Run with: `python -m src.evaluate --checkpoint ... --save-dir ... --calibrate`
+### Priority 6 — Model calibration ✅
+- ECE per class + mean, temperature scaling, reliability diagrams (15-panel)
+- `--calibrate` flag in `evaluate.py`; `calibration.json` loaded by `api.py` at startup
 
 ---
 
-## Known Issues (lower priority)
+## Next: Push AUC Above 0.80 (test)
+
+Ranked by impact-to-effort:
+
+1. **Medical-domain pretraining** — swap ImageNet weights for CheXpert/MIMIC pretrained (HF Hub). Biggest single gain (+0.02–0.04 AUC expected).
+2. **320px resolution** — `image_size_large: 320` already in config. Use batch 48, accumulation ×5. Benefits nodule/fibrosis detail.
+3. **Add Swin-Transformer** — third ensemble member with different inductive bias (+0.01–0.02 AUC from ConvNet+ViT diversity).
+4. **Stochastic Weight Averaging (SWA)** — average last 10–15 epoch checkpoints from ConvNeXt. Free improvement.
+5. **Label noise correction** — cleanlab on NIH labels. Removes the ~10% noise ceiling, especially for Pneumonia (0.717).
+
+---
+
+## Known Issues
 - `src/nih-chest-xray.code-workspace` is inside `src/` — should be at project root
-- `config.yaml` patient split values sum > 1 (val: 0.15 + test: 0.15 + train: 0.82) — test value is unused but confusing
-- Hardcoded arch name in frontend empty state (`App.jsx:877`) — should use `modelInfo?.architecture`
-
-## Recent Fixes
-- `api.py`: added missing `import os`, `import json`, `import pathlib.Path`; temperature now loaded from `calibration.json` at startup and applied as `logits / T` at inference
-- `requirements.txt`: added `fastapi`, `uvicorn[standard]`, `opencv-python`, `requests`, `python-multipart`, `scipy`
-- `.github/workflows/tests.yml`: GitHub Actions CI — runs `pytest tests/ -v` on every push/PR to main
-- `evaluate.py`: `tta_predict()` added; `full_evaluation()` accepts `precomputed_probs/targets` to skip re-inference; `--tta` / `--tta-passes` flags wired into `main()`
-
----
+- `config.yaml` patient split: val+test+train sum > 1 (test value unused but confusing)
 
 ## Architecture Notes
-- Data paths live in `configs/config.yaml` under `data:` — relative paths work from project root on Mac, absolute needed on Windows PC
-- Training is cross-machine: code on Mac, trained via SSH on Windows PC (RTX 5070 Ti at `elton-pc`)
-- Checkpoint config bakes in the data paths at save time — use `--csv-path` etc. flags in `evaluate.py` to override on a different machine
-- `_filter_df_by_split()` is the single source of truth for splits — both dataset and pos_weight use it
+- Data paths in `configs/config.yaml` → relative on Mac, absolute on Windows PC
+- Training: Mac → SSH → Windows PC (RTX 5070 Ti at `elton-pc`)
+- Checkpoint config bakes in data paths at save time — use `--csv-path` etc. to override
+- `_filter_df_by_split()` is single source of truth for splits
 
 ## Tech Stack
 | Layer | Tech |
 |---|---|
-| Backbone | EfficientNetV2-S via timm |
+| Backbones | EfficientNetV2-S + ConvNeXt-Base via timm |
 | Loss | AsymmetricLoss (γ⁻=4, γ⁺=1) |
-| API | FastAPI + Uvicorn |
-| Reports | Ollama (qwen2.5:latest) via SSH tunnel |
+| API | FastAPI + Uvicorn (ensemble inference, temperature calibration) |
+| Reports | Ollama (qwen2.5:latest) |
 | Frontend | React 18 + Framer Motion + Vite |
 | Training hardware | RTX 5070 Ti (17GB VRAM), SSH from Mac Mini |

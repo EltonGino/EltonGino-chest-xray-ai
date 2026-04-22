@@ -3,7 +3,10 @@ FastAPI Inference API — NIH Chest X-ray14 Classifier
 =====================================================
 Endpoints:
   GET  /health        — model status
-  POST /predict       — image → predictions + Grad-CAM + radiology report
+  POST /predict       — image → ensemble predictions + Grad-CAM + radiology report
+
+Ensemble: EfficientNetV2-S + ConvNeXt-Base, probabilities averaged in probability space.
+Grad-CAM runs on EfficientNetV2-S only (faster; used for visualization only).
 
 Author: Elton Gino Santos
 """
@@ -35,7 +38,10 @@ from src.dataset import CLASS_NAMES, NUM_CLASSES, TransformConfig, build_transfo
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
-CHECKPOINT_PATH = "checkpoints/best_model_efficientnet_v2_s.pt"
+CHECKPOINT_PATHS = [
+    os.environ.get("CHECKPOINT_EFFICIENTNET", "checkpoints/best_model_efficientnet_v2_s.pt"),
+    os.environ.get("CHECKPOINT_CONVNEXT",     "checkpoints/best_model_convnext_base.pt"),
+]
 IMAGE_SIZE = 224
 
 def _get_device():
@@ -172,20 +178,44 @@ Use formal medical language. Do not mention AI, machine learning, or probability
 
 # ── App lifecycle ────────────────────────────────────────────────────────────
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print(f"Loading checkpoint: {CHECKPOINT_PATH}  →  device: {DEVICE}")
-    ckpt   = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
+def _load_checkpoint(path: str):
+    """Load a model checkpoint and return (model, arch, epoch, best_auc)."""
+    ckpt   = torch.load(path, map_location=DEVICE, weights_only=False)
     config = ckpt.get("config", {})
     arch   = config.get("model", {}).get("architecture", "efficientnet_v2_s")
-
-    model = build_model(arch=arch, num_classes=NUM_CLASSES, pretrained=False, freeze_backbone=False)
+    model  = build_model(arch=arch, num_classes=NUM_CLASSES, pretrained=False, freeze_backbone=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(DEVICE).eval()
+    return model, arch, ckpt.get("epoch", "?"), ckpt.get("best_auc", 0.0)
 
-    # Build GradCAM once at startup — avoids registering new hooks on every request
-    last_conv = _find_last_conv(model)
-    gradcam   = GradCAM(model, last_conv)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    models   = []
+    archs    = []
+    epochs   = []
+    aucs     = []
+    gradcam  = None
+
+    for path in CHECKPOINT_PATHS:
+        if not Path(path).exists():
+            print(f"[WARN] Checkpoint not found, skipping: {path}")
+            continue
+        print(f"Loading checkpoint: {path}  →  device: {DEVICE}")
+        model, arch, epoch, best_auc = _load_checkpoint(path)
+        models.append(model)
+        archs.append(arch)
+        epochs.append(epoch)
+        aucs.append(best_auc)
+        print(f"  arch={arch}, epoch={epoch}, best_auc={best_auc:.4f}")
+
+        # Build GradCAM on the first (EfficientNetV2-S) model only
+        if gradcam is None:
+            last_conv = _find_last_conv(model)
+            gradcam   = GradCAM(model, last_conv)
+
+    if not models:
+        raise RuntimeError("No checkpoints loaded — cannot start API.")
 
     # Load temperature from calibration file if available
     temperature = 1.0
@@ -201,13 +231,14 @@ async def lifespan(app: FastAPI):
     else:
         print("No calibration.json found — using T=1.0 (uncalibrated)")
 
-    _state["model"]       = model
+    _state["models"]      = models
     _state["gradcam"]     = gradcam
-    _state["arch"]        = arch
-    _state["epoch"]       = ckpt.get("epoch", "?")
-    _state["best_auc"]    = ckpt.get("best_auc", 0.0)
+    _state["archs"]       = archs
+    _state["epochs"]      = epochs
+    _state["aucs"]        = aucs
     _state["temperature"] = temperature
-    print(f"Model ready — arch={arch}, epoch={_state['epoch']}, best_auc={_state['best_auc']:.4f}")
+    ensemble_label = " + ".join(archs)
+    print(f"Ensemble ready — {ensemble_label} ({len(models)} model(s))")
     yield
     _state.clear()
 
@@ -230,11 +261,16 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
+    archs  = _state.get("archs", [])
+    epochs = _state.get("epochs", [])
+    aucs   = _state.get("aucs", [])
     return {
         "status": "ok",
-        "architecture": _state.get("arch"),
-        "epoch": _state.get("epoch"),
-        "best_auc": round(_state.get("best_auc", 0), 4),
+        "ensemble": [
+            {"architecture": a, "epoch": e, "best_auc": round(v, 4)}
+            for a, e, v in zip(archs, epochs, aucs)
+        ],
+        "num_models": len(archs),
         "device": str(DEVICE),
     }
 
@@ -258,14 +294,18 @@ async def predict(
     tfm    = build_transforms(tcfg, train=False)
     tensor = tfm(original_pil).to(DEVICE)
 
-    model:       torch.nn.Module = _state["model"]
+    models:      list            = _state["models"]
     gradcam:     GradCAM         = _state["gradcam"]
     temperature: float           = _state.get("temperature", 1.0)
 
-    # ── Inference ──
+    # ── Ensemble inference — average probabilities across all loaded models ──
+    input_batch = tensor.unsqueeze(0)
+    all_probs = []
     with torch.no_grad():
-        logits = model(tensor.unsqueeze(0))
-        probs  = torch.sigmoid(logits / temperature)[0].cpu()
+        for m in models:
+            logits = m(input_batch)
+            all_probs.append(torch.sigmoid(logits / temperature)[0].cpu())
+    probs = torch.stack(all_probs).mean(dim=0)
 
     predictions = {CLASS_NAMES[i]: round(float(probs[i]), 4) for i in range(NUM_CLASSES)}
 
@@ -290,7 +330,7 @@ async def predict(
             report = _generate_report(predictions)
         except Exception as exc:
             print(f"[WARN] Report generation failed: {exc}")
-            report = "Report generation unavailable — please ensure ANTHROPIC_API_KEY is set."
+            report = "Report generation unavailable — ensure Ollama is running with qwen2.5 pulled."
 
     return JSONResponse({
         "predictions": dict(
@@ -300,9 +340,11 @@ async def predict(
         "gradcam_class": gradcam_class,
         "report":        report,
         "meta": {
-            "architecture": _state["arch"],
-            "epoch":        _state["epoch"],
-            "best_auc":     round(_state.get("best_auc", 0), 4),
+            "ensemble":   [
+                {"architecture": a, "epoch": e, "best_auc": round(v, 4)}
+                for a, e, v in zip(_state["archs"], _state["epochs"], _state["aucs"])
+            ],
+            "num_models": len(_state["models"]),
         },
     })
 

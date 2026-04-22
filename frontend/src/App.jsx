@@ -184,8 +184,14 @@ function Header({ modelInfo }) {
 
       {modelInfo && (
         <div style={{ display: 'flex', gap: 8 }}>
-          <span className="badge badge-accent">{modelInfo.architecture}</span>
-          <span className="badge badge-success">AUC {modelInfo.best_auc?.toFixed(3)}</span>
+          <span className="badge badge-accent">
+            {modelInfo.num_models > 1 ? `Ensemble · ${modelInfo.num_models} models` : (modelInfo.ensemble?.[0]?.architecture ?? 'Model')}
+          </span>
+          {modelInfo.ensemble?.length > 0 && (
+            <span className="badge badge-success">
+              AUC {(modelInfo.ensemble.reduce((s, m) => s + m.best_auc, 0) / modelInfo.ensemble.length).toFixed(3)}
+            </span>
+          )}
         </div>
       )}
     </motion.header>
@@ -657,7 +663,7 @@ export default function App() {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
       setResult(data)
-      if (data.meta) setModelInfo(prev => ({ ...prev, ...data.meta }))
+      if (data.meta) setModelInfo(prev => ({ ...prev, ...data.meta, ensemble: data.meta.ensemble ?? prev?.ensemble }))
     } catch (err) {
       setError(err.response?.data?.detail || 'Analysis failed. Is the API running?')
     } finally {
@@ -878,7 +884,7 @@ export default function App() {
                 textAlign: 'center',
               }}
             >
-              EfficientNetV2-S · 15-class multi-label · NIH ChestX-ray14
+              {modelInfo?.num_models > 1 ? `Ensemble · ${modelInfo.num_models} models` : (modelInfo?.ensemble?.[0]?.architecture ?? 'EfficientNetV2-S')} · 15-class multi-label · NIH ChestX-ray14
             </motion.div>
           )}
         </main>
