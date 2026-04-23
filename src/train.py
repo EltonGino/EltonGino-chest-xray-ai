@@ -37,6 +37,7 @@ from contextlib import nullcontext
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn as swa_update_bn
 from sklearn.metrics import roc_auc_score, f1_score, average_precision_score
 from src.dataset import compute_pos_weight_from_csv
 
@@ -82,6 +83,15 @@ def get_scheduler(optimizer, warmup_epochs: int, total_epochs: int, min_lr: floa
     return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
 
 
+# ── MixUp ─────────────────────────────────────────────────────────────────
+
+def mixup_batch(images: torch.Tensor, labels: torch.Tensor, alpha: float = 0.4):
+    """Blend two random samples. Soft targets make ASL more robust to label noise."""
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(images.size(0), device=images.device)
+    return lam * images + (1 - lam) * images[idx], lam * labels + (1 - lam) * labels[idx]
+
+
 # ── Training Step ─────────────────────────────────────────────────────────
 
 def train_one_epoch(
@@ -93,8 +103,9 @@ def train_one_epoch(
     device: torch.device,
     accum_steps: int = 1,
     use_amp: bool = True,
+    mixup_alpha: float = 0.0,
 ) -> Dict[str, float]:
-    """Single training epoch with optional AMP and gradient accumulation."""
+    """Single training epoch with optional AMP, gradient accumulation, and MixUp."""
     model.train()
     running_loss = 0.0
     all_logits = []
@@ -107,6 +118,9 @@ def train_one_epoch(
     for step, (images, labels) in enumerate(tqdm(dataloader, desc="  train", leave=False)):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+
+        if mixup_alpha > 0:
+            images, labels = mixup_batch(images, labels, mixup_alpha)
 
         # AMP only on CUDA; MPS/CPU use normal precision context
         amp_ctx = torch.amp.autocast("cuda", enabled=use_amp) if (use_amp and device.type == "cuda") else nullcontext()
@@ -289,10 +303,11 @@ def train(config: dict):
     # W&B init
     use_wandb = config["logging"].get("use_wandb", False) and WANDB_AVAILABLE
     if use_wandb:
+        img_size = config["preprocessing"]["image_size"]
         wandb.init(
             project=config["logging"]["project_name"],
             config=config,
-            name=f"{config['model']['architecture']}_224px",
+            name=f"{config['model']['architecture']}_{img_size}px",
         )
         print("W&B run initialized.")
 
@@ -323,6 +338,20 @@ def train(config: dict):
         drop_path_rate=config["model"]["drop_path_rate"],
         freeze_backbone=config["model"]["freeze_backbone"],
     ).to(device)
+
+    # ── Fine-tune from existing checkpoint (backbone weights only) ──
+    finetune_from = config.get("training", {}).get("finetune_from")
+    if finetune_from and Path(finetune_from).exists():
+        print(f"Loading backbone weights from: {finetune_from}")
+        ft_ckpt = torch.load(finetune_from, map_location=device, weights_only=False)
+        src_sd = ft_ckpt["model_state_dict"]
+        backbone_sd = {k[len("backbone."):]: v for k, v in src_sd.items() if k.startswith("backbone.")}
+        missing, unexpected = model.backbone.load_state_dict(backbone_sd, strict=False)
+        loaded = len(backbone_sd) - len(missing)
+        print(f"  Loaded {loaded}/{len(backbone_sd)} backbone params"
+              + (f" ({len(missing)} missing — expected for arch changes)" if missing else ""))
+    elif finetune_from:
+        print(f"[WARN] finetune_from path not found: {finetune_from}")
 
     # ── Loss ──
     pos_weight = compute_pos_weight_from_csv(
@@ -369,6 +398,20 @@ def train(config: dict):
 
     # ── AMP Scaler ──
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda")) if device.type == "cuda" else None
+
+    # ── SWA Setup ──
+    swa_cfg = config["training"].get("swa", {})
+    swa_enabled = swa_cfg.get("enabled", False)
+    swa_start   = swa_cfg.get("start_epoch", max(1, int(config["training"]["epochs"] * 0.75)))
+    swa_model   = AveragedModel(model) if swa_enabled else None
+    swa_sched   = SWALR(optimizer, swa_lr=swa_cfg.get("lr", 5e-6), anneal_epochs=5) if swa_enabled else None
+    if swa_enabled:
+        print(f"SWA enabled — averaging from epoch {swa_start}")
+
+    # ── MixUp ──
+    mixup_alpha = config["training"].get("mixup_alpha", 0.0)
+    if mixup_alpha > 0:
+        print(f"MixUp enabled — alpha={mixup_alpha}")
 
     # ── Training ──
     early_stopping = EarlyStopping(
@@ -418,12 +461,18 @@ def train(config: dict):
         train_metrics = train_one_epoch(
             model, loaders["train"], criterion, optimizer, scaler,
             device, config["training"]["gradient_accumulation_steps"], use_amp,
+            mixup_alpha=mixup_alpha,
         )
 
         # ── Validate ──
         val_metrics = validate(model, loaders["val"], criterion, device, use_amp)
 
-        scheduler.step()
+        # ── SWA update or normal scheduler step ──
+        if swa_enabled and epoch >= swa_start:
+            swa_model.update_parameters(model)
+            swa_sched.step()
+        else:
+            scheduler.step()
 
         elapsed = time.time() - t0
 
@@ -480,6 +529,31 @@ def train(config: dict):
             print(f"\n  Early stopping triggered after {epoch} epochs")
             break
 
+    # ── SWA Finalization ──
+    if swa_enabled and swa_model is not None:
+        print("\nUpdating BatchNorm statistics for SWA model...")
+        swa_update_bn(loaders["train"], swa_model, device=device)
+        swa_val = validate(swa_model, loaders["val"], criterion, device, use_amp)
+        print(f"SWA Val AUC: {swa_val['auc_mean']:.4f}  (regular best: {best_auc:.4f})")
+        swa_path = checkpoint_dir / f"best_model_{config['model']['architecture']}_swa.pt"
+        # Strip the AveragedModel wrapper so the checkpoint loads like a normal one
+        inner_sd = {k[len("module."):]: v
+                    for k, v in swa_model.state_dict().items()
+                    if k.startswith("module.")}
+        torch.save({
+            "epoch": f"swa_{swa_start}-{epoch}",
+            "model_state_dict": inner_sd,
+            "best_auc": swa_val["auc_mean"],
+            "val_metrics": swa_val,
+            "config": config,
+            "history": history,
+        }, swa_path)
+        print(f"SWA checkpoint saved → {swa_path}")
+        if swa_val["auc_mean"] > best_auc:
+            best_auc = swa_val["auc_mean"]
+        if use_wandb:
+            wandb.summary["swa_val_auc"] = swa_val["auc_mean"]
+
     print(f"\n{'='*60}")
     print(f"Training complete! Best AUC: {best_auc:.4f}")
     print(f"{'='*60}")
@@ -502,6 +576,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--max-samples", type=int, default=None, help="Limit dataset size for debugging")
     parser.add_argument("--no-freeze", action="store_true", help="Don't freeze backbone")
+    parser.add_argument("--finetune-from", type=str, default=None,
+                        help="Load backbone weights from checkpoint before training")
     return parser.parse_args()
 
 
@@ -526,6 +602,8 @@ def main():
         config["dataset"]["max_samples"] = args.max_samples
     if args.no_freeze:
         config["model"]["freeze_backbone"] = False
+    if args.finetune_from:
+        config["training"]["finetune_from"] = args.finetune_from
 
     train(config)
 

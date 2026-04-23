@@ -44,13 +44,19 @@ class ChestXrayClassifier(nn.Module):
         "efficientnet_v2_m": "tf_efficientnetv2_m.in21k_ft_in1k",
         "efficientnet_v2_l": "tf_efficientnetv2_l.in21k_ft_in1k",
         # ConvNeXt
-        "convnext_tiny": "convnext_tiny.fb_in22k_ft_in1k",
+        "convnext_tiny":  "convnext_tiny.fb_in22k_ft_in1k",
         "convnext_small": "convnext_small.fb_in22k_ft_in1k",
-        "convnext_base": "convnext_base.fb_in22k_ft_in1k",
+        "convnext_base":  "convnext_base.fb_in22k_ft_in1k",
+        "convnext_large": "convnext_large.fb_in22k_ft_in1k",
+        # Swin Transformer (ImageNet-22k pretrained — strong transfer)
+        "swin_base":  "swin_base_patch4_window7_224.ms_in22k_ft_in1k",
+        "swin_large": "swin_large_patch4_window7_224.ms_in22k_ft_in1k",
         # Vision Transformer
         "vit_small_patch16_224": "vit_small_patch16_224.augreg_in21k_ft_in1k",
-        "vit_base_patch16_224": "vit_base_patch16_224.augreg2_in21k_ft_in1k",
-        "vit_base_patch16_384": "vit_base_patch16_384.augreg_in21k_ft_in1k",
+        "vit_base_patch16_224":  "vit_base_patch16_224.augreg2_in21k_ft_in1k",
+        "vit_base_patch16_384":  "vit_base_patch16_384.augreg_in21k_ft_in1k",
+        # Medical-domain pretrained (chest X-ray DINO, Microsoft)
+        "rad_dino": "hf-hub:microsoft/rad-dino",
     }
 
     def __init__(
@@ -70,13 +76,22 @@ class ChestXrayClassifier(nn.Module):
         timm_name = self.SUPPORTED_ARCHS.get(arch, arch)
 
         # Create backbone (remove original classifier head)
-        self.backbone = create_model(
-            timm_name,
-            pretrained=pretrained,
-            num_classes=0,  # Remove classifier, get features only
-            drop_rate=0.0,  # We handle dropout ourselves
-            drop_path_rate=drop_path_rate,
-        )
+        # Some models (e.g. rad-dino) don't expose drop_path_rate via create_model
+        try:
+            self.backbone = create_model(
+                timm_name,
+                pretrained=pretrained,
+                num_classes=0,
+                drop_rate=0.0,
+                drop_path_rate=drop_path_rate,
+            )
+        except TypeError:
+            self.backbone = create_model(
+                timm_name,
+                pretrained=pretrained,
+                num_classes=0,
+                drop_rate=0.0,
+            )
 
         # Get feature dimension from backbone
         with torch.no_grad():
@@ -225,13 +240,17 @@ class AsymmetricLoss(nn.Module):
         gamma_neg: float = 4.0,
         gamma_pos: float = 1.0,
         clip: float = 0.05,
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
         self.clip = clip
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if self.label_smoothing > 0:
+            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
         probs = torch.sigmoid(logits)
 
         # Asymmetric clipping (hard thresholding for negatives)
@@ -271,6 +290,7 @@ def get_loss_function(
         return AsymmetricLoss(
             gamma_neg=kwargs.get("gamma_neg", 4.0),
             gamma_pos=kwargs.get("gamma_pos", 1.0),
+            label_smoothing=kwargs.get("label_smoothing", 0.0),
         )
     else:
         raise ValueError(f"Unknown loss: {loss_name}. Use 'bce', 'focal', or 'asymmetric'.")
