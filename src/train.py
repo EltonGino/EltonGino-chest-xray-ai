@@ -119,6 +119,7 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        orig_labels = labels  # keep binary labels for metric computation
         if mixup_alpha > 0:
             images, labels = mixup_batch(images, labels, mixup_alpha)
 
@@ -146,10 +147,10 @@ def train_one_epoch(
                 optimizer.step()
             optimizer.zero_grad()
 
-        # Track metrics
+        # Track metrics (use original binary labels, not mixed)
         running_loss += loss.item() * accum_steps
         all_logits.append(logits.detach().cpu())
-        all_targets.append(labels.detach().cpu())
+        all_targets.append(orig_labels.detach().cpu())
 
         # Progress
         if (step + 1) % 100 == 0:
