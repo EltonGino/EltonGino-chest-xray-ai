@@ -15,6 +15,24 @@ import timm
 from timm.models import create_model
 
 
+class _RadDinoWrapper(nn.Module):
+    """Wraps microsoft/rad-dino (HF Transformers ViT-B/14) as a backbone.
+    Returns the CLS token [B, 768] — same interface as timm feature extractors.
+    """
+    def __init__(self, pretrained: bool = True):
+        super().__init__()
+        from transformers import AutoModel, AutoConfig
+        if pretrained:
+            self.encoder = AutoModel.from_pretrained("microsoft/rad-dino")
+        else:
+            self.encoder = AutoModel.from_config(
+                AutoConfig.from_pretrained("microsoft/rad-dino")
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(pixel_values=x).last_hidden_state[:, 0]  # CLS token [B, 768]
+
+
 # ── Base Multi-Label Classifier ───────────────────────────────────────────
 
 class ChestXrayClassifier(nn.Module):
@@ -56,7 +74,8 @@ class ChestXrayClassifier(nn.Module):
         "vit_base_patch16_224":  "vit_base_patch16_224.augreg2_in21k_ft_in1k",
         "vit_base_patch16_384":  "vit_base_patch16_384.augreg_in21k_ft_in1k",
         # Medical-domain pretrained (chest X-ray DINO, Microsoft)
-        "rad_dino": "hf-hub:microsoft/rad-dino",
+        # Loaded via transformers, not timm — handled separately in __init__
+        "rad_dino": None,
     }
 
     def __init__(
@@ -72,31 +91,32 @@ class ChestXrayClassifier(nn.Module):
         self.arch = arch
         self.num_classes = num_classes
 
-        # Resolve timm model name
-        timm_name = self.SUPPORTED_ARCHS.get(arch, arch)
-
-        # Create backbone (remove original classifier head)
-        # Some models (e.g. rad-dino) don't expose drop_path_rate via create_model
-        try:
-            self.backbone = create_model(
-                timm_name,
-                pretrained=pretrained,
-                num_classes=0,
-                drop_rate=0.0,
-                drop_path_rate=drop_path_rate,
-            )
-        except TypeError:
-            self.backbone = create_model(
-                timm_name,
-                pretrained=pretrained,
-                num_classes=0,
-                drop_rate=0.0,
-            )
-
-        # Get feature dimension from backbone
-        with torch.no_grad():
-            dummy = torch.randn(1, 3, 224, 224)
-            feat_dim = self.backbone(dummy).shape[-1]
+        # Build backbone
+        if arch == "rad_dino":
+            # microsoft/rad-dino is a HF Transformers model, not timm-compatible
+            self.backbone = _RadDinoWrapper(pretrained=pretrained)
+            feat_dim = 768  # ViT-B CLS token dim
+        else:
+            timm_name = self.SUPPORTED_ARCHS.get(arch, arch)
+            # Some models don't expose drop_path_rate through create_model kwargs
+            try:
+                self.backbone = create_model(
+                    timm_name,
+                    pretrained=pretrained,
+                    num_classes=0,
+                    drop_rate=0.0,
+                    drop_path_rate=drop_path_rate,
+                )
+            except TypeError:
+                self.backbone = create_model(
+                    timm_name,
+                    pretrained=pretrained,
+                    num_classes=0,
+                    drop_rate=0.0,
+                )
+            with torch.no_grad():
+                dummy = torch.randn(1, 3, 224, 224)
+                feat_dim = self.backbone(dummy).shape[-1]
 
         # Custom classification head
         self.head = nn.Sequential(

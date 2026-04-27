@@ -5,6 +5,7 @@
 torch>=2.2.0
 torchvision>=0.17.0
 timm>=1.0.0
+transformers>=4.40.0
 
 # Data
 datasets>=2.19.0
