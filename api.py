@@ -40,6 +40,8 @@ from src.dataset import CLASS_NAMES, NUM_CLASSES, TransformConfig, build_transfo
 
 CHECKPOINT_PATHS = [
     os.environ.get("CHECKPOINT_EFFICIENTNET", "checkpoints/best_model_efficientnet_v2_s.pt"),
+    os.environ.get("CHECKPOINT_RAD_DINO",     "checkpoints/best_model_rad_dino.pt"),
+    os.environ.get("CHECKPOINT_SWIN_BASE",    "checkpoints/best_model_swin_base.pt"),
     os.environ.get("CHECKPOINT_CONVNEXT",     "checkpoints/best_model_convnext_base.pt"),
 ]
 IMAGE_SIZE = 224

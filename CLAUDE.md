@@ -4,12 +4,14 @@
 Multi-label chest X-ray pathology classifier trained on NIH ChestX-ray14 (112k images, 15 classes).
 Full-stack demo: FastAPI backend + React frontend + Grad-CAM + Ollama radiology reports.
 
-**Current best result: 0.793 mean AUC (Ensemble + TTA)**
-| Checkpoint | Val AUC | Test AUC | Epoch |
-|---|---|---|---|
-| `checkpoints/best_model_efficientnet_v2_s.pt` | 0.7859 | 0.7585 | 28 |
-| `checkpoints/best_model_convnext_base.pt`     | 0.8199 | 0.770  | 54 |
-| **Ensemble + TTA (7 passes)**                 | —      | **0.793** | — |
+**Current best result: 0.815 mean AUC (4-model Ensemble + TTA)**
+| Checkpoint | Val AUC | Test AUC | Epoch | Resolution |
+|---|---|---|---|---|
+| `checkpoints/best_model_efficientnet_v2_s.pt` | 0.786 | 0.759 | 28 | 224px |
+| `checkpoints/best_model_rad_dino.pt`          | 0.832 | —     | 40 | 224px |
+| `checkpoints/best_model_swin_base.pt`         | 0.816 | —     | 60 | 224px |
+| `checkpoints/best_model_convnext_base.pt`     | 0.834 | —     | 29 | 320px |
+| **4-Model Ensemble + TTA (7 passes)**         | —     | **0.815** | — | — |
 
 ---
 
@@ -23,11 +25,13 @@ Full-stack demo: FastAPI backend + React frontend + Grad-CAM + Ollama radiology 
 - Per-epoch W&B logging: train/val loss, mean AUC, F1, AP, LR, per-class val AUC
 - `wandb.summary["best_val_auc"]` set at end of training; graceful fallback if W&B absent
 
-### Priority 3 — Push AUC above 0.80 ✅ (val: 0.820, test: 0.793)
+### Priority 3 — Push AUC above 0.80 ✅ (test: 0.815)
 - TTA: `tta_predict()` in `evaluate.py`, 7 passes, no horizontal flip (CXR laterality)
-- ConvNeXt-Base trained 60 epochs, patience 10 — val AUC 0.8199 at epoch 54
-- Ensemble: `ensemble_predict()` in `evaluate.py`, averages probabilities across both models
-- `api.py` updated to load both checkpoints at startup, average predictions at inference
+- rad-dino (medical pretrained ViT-B/14) — val AUC 0.832, best individual model
+- Swin-Base 224px — val AUC 0.816, adds architectural diversity
+- ConvNeXt-Base 320px fine-tuned from 224px checkpoint — val AUC 0.834
+- MixUp (α=0.3–0.4) + label smoothing (0.05) + SWA added to training pipeline
+- `api.py` updated to load all 4 checkpoints, average predictions at inference
 
 ### Priority 4 — Unit tests ✅
 - 29 tests in `tests/test_dataset.py` — encode_findings, patient splits, pos_weight
